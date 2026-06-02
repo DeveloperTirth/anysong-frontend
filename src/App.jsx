@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import './App.css';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = 'https://anysong-backend.onrender.com';
 
 function App() {
   const [query, setQuery] = useState('');
