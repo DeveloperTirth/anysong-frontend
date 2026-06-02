@@ -142,7 +142,21 @@ function App() {
       window.URL.revokeObjectURL(url);
     } catch (error) {
       console.error('Download error:', error);
-      alert('Failed to download song. Please try again.');
+      
+      // Fallback: direct browser-managed download to bypass CORS / Blob limits
+      try {
+        console.log('Attempting fallback direct download...');
+        const downloadUrl = `${API_BASE}/api/download?id=${song.id}`;
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = downloadUrl;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      } catch (fallbackError) {
+        console.error('Fallback download also failed:', fallbackError);
+        alert('Failed to download song. Please try again.');
+      }
     } finally {
       setDownloadingIds(prev => ({ ...prev, [song.id]: false }));
     }
