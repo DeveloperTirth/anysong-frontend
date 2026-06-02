@@ -4,22 +4,98 @@ import './App.css';
 const API_BASE = 'https://anysong-backend.onrender.com';
 
 function App() {
-  const [query, setQuery] = useState('');
-  const [songs, setSongs] = useState([]);
+  // Load state from localStorage for absolute persistence (UX continuity)
+  const [query, setQuery] = useState(() => localStorage.getItem('anysong_query') || '');
+  const [songs, setSongs] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('anysong_songs')) || [];
+    } catch {
+      return [];
+    }
+  });
   const [loading, setLoading] = useState(false);
-  const [hasSearched, setHasSearched] = useState(false);
-  const [currentSong, setCurrentSong] = useState(null);
+  const [hasSearched, setHasSearched] = useState(() => localStorage.getItem('anysong_has_searched') === 'true');
+  const [currentSong, setCurrentSong] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('anysong_current_song')) || null;
+    } catch {
+      return null;
+    }
+  });
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [volume, setVolume] = useState(0.8);
-  const [isMuted, setIsMuted] = useState(false);
+  const [volume, setVolume] = useState(() => {
+    const val = localStorage.getItem('anysong_volume');
+    return val !== null ? parseFloat(val) : 0.8;
+  });
+  const [isMuted, setIsMuted] = useState(() => localStorage.getItem('anysong_is_muted') === 'true');
   const [downloadingIds, setDownloadingIds] = useState({});
+  const [recoveryAttempts, setRecoveryAttempts] = useState(0);
 
   const audioRef = useRef(null);
-  const progressSliderRef = useRef(null);
+  const fadeIntervalRef = useRef(null);
 
-  // Initialize Audio
+  // Sync state changes with localStorage
+  useEffect(() => {
+    localStorage.setItem('anysong_query', query);
+  }, [query]);
+
+  useEffect(() => {
+    localStorage.setItem('anysong_songs', JSON.stringify(songs));
+  }, [songs]);
+
+  useEffect(() => {
+    localStorage.setItem('anysong_has_searched', hasSearched.toString());
+  }, [hasSearched]);
+
+  useEffect(() => {
+    localStorage.setItem('anysong_current_song', JSON.stringify(currentSong));
+  }, [currentSong]);
+
+  useEffect(() => {
+    localStorage.setItem('anysong_volume', volume.toString());
+  }, [volume]);
+
+  useEffect(() => {
+    localStorage.setItem('anysong_is_muted', isMuted.toString());
+  }, [isMuted]);
+
+  // Premium Audio Engineering: Smooth volume fading to prevent abrupt playback start/stops
+  const fadeVolume = (targetVolume, durationMs = 200) => {
+    return new Promise((resolve) => {
+      if (!audioRef.current) {
+        resolve();
+        return;
+      }
+
+      if (fadeIntervalRef.current) {
+        clearInterval(fadeIntervalRef.current);
+      }
+
+      const audio = audioRef.current;
+      const startVolume = audio.volume;
+      const volumeDiff = targetVolume - startVolume;
+      const stepTime = 15; // 15ms per step
+      const steps = durationMs / stepTime;
+      const volumeStep = volumeDiff / steps;
+      let currentStep = 0;
+
+      fadeIntervalRef.current = setInterval(() => {
+        currentStep++;
+        const nextVolume = startVolume + (volumeStep * currentStep);
+        audio.volume = Math.max(0, Math.min(1, nextVolume));
+
+        if (currentStep >= steps) {
+          clearInterval(fadeIntervalRef.current);
+          audio.volume = targetVolume;
+          resolve();
+        }
+      }, stepTime);
+    });
+  };
+
+  // Initialize HTML5 Audio and attach event handlers
   useEffect(() => {
     audioRef.current = new Audio();
     const audio = audioRef.current;
@@ -27,10 +103,47 @@ function App() {
     const handlePlay = () => setIsPlaying(true);
     const handlePause = () => setIsPlaying(false);
     const handleTimeUpdate = () => setCurrentTime(audio.currentTime);
-    const handleLoadedMetadata = () => setDuration(audio.duration || 0);
+    const handleLoadedMetadata = () => {
+      setDuration(audio.duration || 0);
+      setRecoveryAttempts(0); // Reset recovery tries upon success
+    };
+    
     const handleEnded = () => {
       setIsPlaying(false);
       setCurrentTime(0);
+      
+      // Auto-play next song in the search grid if available for a premium radio flow
+      if (songs.length > 0 && currentSong) {
+        const currentIndex = songs.findIndex(s => s.id === currentSong.id);
+        if (currentIndex !== -1 && currentIndex < songs.length - 1) {
+          console.log("Auto-playing next song...");
+          handlePlaySong(songs[currentIndex + 1]);
+        }
+      }
+    };
+
+    // Fail-Safe recovery: intercepts dropped audio packages and re-requests stream proxy
+    const handleError = (e) => {
+      console.error('Audio playback error intercepted:', e);
+      if (currentSong && recoveryAttempts < 3) {
+        setRecoveryAttempts(prev => prev + 1);
+        console.log(`Stream interrupted. Recovery attempt #${recoveryAttempts + 1}/3...`);
+        
+        const lastTime = audio.currentTime;
+        audio.src = `${API_BASE}/api/stream?id=${currentSong.id}&recovery=${Date.now()}`;
+        audio.load();
+        
+        audio.addEventListener('loadedmetadata', function onRestore() {
+          audio.currentTime = lastTime;
+          audio.play()
+            .then(() => console.log('Seamless audio playback recovered.'))
+            .catch(err => console.error('Play restoration rejected:', err));
+          audio.removeEventListener('loadedmetadata', onRestore);
+        });
+      } else if (recoveryAttempts >= 3) {
+        setIsPlaying(false);
+        alert('Network connection to streaming host lost. Please check your internet connection.');
+      }
     };
 
     audio.addEventListener('play', handlePlay);
@@ -38,21 +151,26 @@ function App() {
     audio.addEventListener('timeupdate', handleTimeUpdate);
     audio.addEventListener('loadedmetadata', handleLoadedMetadata);
     audio.addEventListener('ended', handleEnded);
+    audio.addEventListener('error', handleError);
 
-    // Sync volume initially
-    audio.volume = volume;
+    // Initial volume synchronization
+    audio.volume = isMuted ? 0 : volume;
 
     return () => {
+      if (fadeIntervalRef.current) {
+        clearInterval(fadeIntervalRef.current);
+      }
       audio.removeEventListener('play', handlePlay);
       audio.removeEventListener('pause', handlePause);
       audio.removeEventListener('timeupdate', handleTimeUpdate);
       audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
       audio.removeEventListener('ended', handleEnded);
+      audio.removeEventListener('error', handleError);
       audio.pause();
     };
-  }, []);
+  }, [songs, currentSong, volume, isMuted, recoveryAttempts]);
 
-  // Update volume
+  // Volume slider sync
   useEffect(() => {
     if (audioRef.current) {
       audioRef.current.volume = isMuted ? 0 : volume;
@@ -61,7 +179,7 @@ function App() {
 
   const handleSearch = async (e) => {
     if (e) e.preventDefault();
-    if (!query.trim()) return;
+    if (!query.trim() || loading) return;
 
     setLoading(true);
     setHasSearched(true);
@@ -72,32 +190,57 @@ function App() {
       setSongs(data.results || []);
     } catch (error) {
       console.error('Search error:', error);
-      setSongs([]);
+      // Failsafe: if search endpoint has issues, do not completely wipe existing state
     } finally {
       setLoading(false);
     }
   };
 
-  const handlePlaySong = (song) => {
+  const handlePlaySong = async (song) => {
     if (!audioRef.current) return;
 
     if (currentSong && currentSong.id === song.id) {
       if (isPlaying) {
+        // Fade volume out smoothly before pausing (delivers premium acoustic finish)
+        const currentVol = isMuted ? 0 : volume;
+        await fadeVolume(0, 150);
         audioRef.current.pause();
+        audioRef.current.volume = currentVol; // Restore volume internally for resume
       } else {
-        audioRef.current.play().catch(err => console.error('Play failed:', err));
+        audioRef.current.volume = 0;
+        audioRef.current.play().catch(err => console.error('Play start rejected:', err));
+        const targetVol = isMuted ? 0 : volume;
+        await fadeVolume(targetVol, 200);
       }
     } else {
+      // Fade out previous audio if playing
+      if (isPlaying) {
+        await fadeVolume(0, 120);
+      }
       audioRef.current.pause();
+      
       setCurrentSong(song);
       setCurrentTime(0);
       setDuration(0);
       
-      // Point the source to our proxy streaming endpoint
       audioRef.current.src = `${API_BASE}/api/stream?id=${song.id}`;
+      audioRef.current.volume = 0;
+      audioRef.current.load();
+      
       audioRef.current.play()
-        .then(() => setIsPlaying(true))
-        .catch(err => console.error('Streaming start failed:', err));
+        .then(async () => {
+          setIsPlaying(true);
+          const targetVol = isMuted ? 0 : volume;
+          await fadeVolume(targetVol, 220);
+        })
+        .catch(err => {
+          console.error('Streaming startup rejected:', err);
+          // Auto-recovery fallback try
+          audioRef.current.src = `${API_BASE}/api/stream?id=${song.id}&retry=true`;
+          audioRef.current.play()
+            .then(() => setIsPlaying(true))
+            .catch(retryErr => console.error("Secondary stream startup failed:", retryErr));
+        });
     }
   };
 
@@ -125,27 +268,24 @@ function App() {
 
     setDownloadingIds(prev => ({ ...prev, [song.id]: true }));
     try {
+      // Direct high-quality download resolution
       const response = await fetch(`${API_BASE}/api/download?id=${song.id}`);
-      if (!response.ok) throw new Error('Download failed');
+      if (!response.ok) throw new Error('Download request rejected by server');
 
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.style.display = 'none';
       a.href = url;
-      
-      // The backend sets the Content-Disposition header with the correct title,
-      // but we add a fallback name here just in case.
       a.download = `${song.title.replace(/[^a-zA-Z0-9]/g, '_')}.m4a`;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
     } catch (error) {
-      console.error('Download error:', error);
+      console.error('Primary blob fetch download failed. Initiating fallback download...', error);
       
-      // Fallback: direct browser-managed download to bypass CORS / Blob limits
+      // Fallback: browser native download link bypasses CORS restrictions and memory caps
       try {
-        console.log('Attempting fallback direct download...');
         const downloadUrl = `${API_BASE}/api/download?id=${song.id}`;
         const a = document.createElement('a');
         a.style.display = 'none';
@@ -154,8 +294,8 @@ function App() {
         a.click();
         document.body.removeChild(a);
       } catch (fallbackError) {
-        console.error('Fallback download also failed:', fallbackError);
-        alert('Failed to download song. Please try again.');
+        console.error('Secondary direct fallback download failed:', fallbackError);
+        alert('Downloading failed. Server blocks active or files are restricted.');
       }
     } finally {
       setDownloadingIds(prev => ({ ...prev, [song.id]: false }));
@@ -190,6 +330,7 @@ function App() {
           placeholder="Search for any song, artist, or album..."
           value={query}
           onChange={(e) => setQuery(e.target.value)}
+          disabled={loading}
         />
         <button type="submit" className="search-button" disabled={loading}>
           {loading ? (
